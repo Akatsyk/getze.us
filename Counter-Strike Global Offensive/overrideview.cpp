@@ -1,0 +1,171 @@
+#include "hooked.hpp"
+#include "displacement.hpp"
+#include "player.hpp"
+#include "weapon.hpp"
+#include "prediction.hpp"
+#include "movement.hpp"
+#include "aimbot.hpp"
+#include "anti_aimbot.hpp"
+#include "menu.h"
+#include "game_movement.h"
+#include "lag_compensation.hpp"
+#include <intrin.h>
+#include "rmenu.hpp"
+
+namespace Hooked
+{
+
+	void __fastcall OverrideView(void* ecx, void* edx, CViewSetup* vsView)
+	{
+		using Fn = void(__thiscall*)(void*, CViewSetup*);
+
+		static ConVar* zoom_sensitivity_ratio_mouse = NULL;
+		static float defaultSens = 1.0f;
+
+		if (!zoom_sensitivity_ratio_mouse)
+		{
+			zoom_sensitivity_ratio_mouse = Source::m_pCvar->FindVar("zoom_sensitivity_ratio_mouse");
+
+			defaultSens = zoom_sensitivity_ratio_mouse->GetFloat();
+		}
+
+		if (cheat::main::fakeducking && cheat::main::local() && !cheat::main::local()->IsDead())
+			vsView->origin = cheat::main::local()->get_abs_origin() + Vector(0, 0, Source::m_pGameMovement->GetPlayerViewOffset(false).z);
+		
+		if (cheat::main::thirdperson && cheat::Cvars.Visuals_lp_forcetp.GetValue() && cheat::main::local() && !cheat::main::local()->IsDead() && Source::m_pClientState->m_iDeltaTick > 0 && !cheat::main::updating_skins)
+		{
+			if (!Source::m_pInput->m_fCameraInThirdPerson)
+				Source::m_pInput->m_fCameraInThirdPerson = true;
+
+			if (Source::m_pInput->m_fCameraInThirdPerson)
+			{
+				trace_t trace;
+				auto angles = Engine::Movement::Instance()->m_qRealAngles;
+
+				Vector camForward, camRight, camUp;
+				Vector camAngles;
+
+				camAngles[0] = angles[0];
+				camAngles[1] = angles[1];
+				camAngles[2] = cheat::Cvars.Visuals_lp_tpdist.GetValue();
+
+				Math::AngleVectors(camAngles, &camForward, &camRight, &camUp);
+
+				Vector vecCamOffset = cheat::main::local()->GetEyePosition() + (camForward * -(cheat::Cvars.Visuals_lp_tpdist.GetValue())) + (camRight * 1.f) + (camUp * 1.f);
+
+				Ray_t ray;
+				ray.Init(cheat::main::local()->GetEyePosition(), vecCamOffset, Vector(-16, -16, -16), Vector(16, 16, 16));
+				CTraceFilterWorldAndPropsOnly filter;
+				filter.pSkip = cheat::main::local();
+				Source::m_pEngineTrace->TraceRay(ray, MASK_SOLID & ~CONTENTS_MONSTER, &filter, &trace);
+
+				static float old_frac = 0.f;
+
+				if (trace.fraction < 1.0f)
+				{
+					if (trace.m_pEnt)
+					{
+						if (!trace.m_pEnt->GetClientClass() || trace.m_pEnt->GetClientClass() && trace.m_pEnt->GetClientClass()->m_ClassID != class_ids::CCSPlayer) {
+							camAngles[2] *= trace.fraction;
+
+							old_frac = trace.fraction;
+						}
+						else if (old_frac < trace.fraction)
+							camAngles[2] *= old_frac;
+					}
+				}
+
+				Source::m_pInput->m_vecCameraOffset = angles.NiceCode();
+				Source::m_pInput->m_vecCameraOffset.z = camAngles[2]; // Thirdperson Distance
+			}
+		}
+		else {
+			Source::m_pInput->m_fCameraInThirdPerson = false;
+			Source::m_pInput->m_vecCameraOffset.z = 0.f;
+
+			static auto vmodel_x = Source::m_pCvar->FindVar("viewmodel_offset_x");
+			if (vmodel_x) {
+				vmodel_x->m_fnChangeCallbacks.m_Size = NULL;
+				vmodel_x->SetValue(cheat::Cvars.Visuals_misc_off_x.GetValue());
+			}
+
+			static auto vmodel_y = Source::m_pCvar->FindVar("viewmodel_offset_y");
+			if (vmodel_y) {
+				vmodel_y->m_fnChangeCallbacks.m_Size = NULL;
+				vmodel_y->SetValue(cheat::Cvars.Visuals_misc_off_y.GetValue());
+			}
+
+			static auto vmodel_z = Source::m_pCvar->FindVar("viewmodel_offset_z");
+			if (vmodel_z) {
+				vmodel_z->m_fnChangeCallbacks.m_Size = NULL;
+				vmodel_z->SetValue(cheat::Cvars.Visuals_misc_off_z.GetValue());
+			}
+		}
+		
+		if (cheat::main::local() && !cheat::main::updating_skins) {
+			auto local_weapon = (C_WeaponCSBaseGun*)(Source::m_pEntList->GetClientEntityFromHandle(cheat::main::local()->m_hActiveWeapon()));
+
+			if (local_weapon)
+			{
+				auto zl = local_weapon->m_zoomLevel();
+
+				if (zl == 1)
+					vsView->fov = 90.0f;
+				else if (zl == 2)
+					vsView->fov = 45.0f;
+
+				/*if (zl <= 0) {
+					if (zoom_sensitivity_ratio_mouse->GetFloat() != defaultSens)
+						zoom_sensitivity_ratio_mouse->SetValue(defaultSens);
+
+					cheat::main::fov = vsView->fov;
+				}
+				else
+				{
+					if (cheat::Cvars.Visuals_rem_second_scope.GetValue() && zl != 2) {
+						vsView->fov = cheat::main::fov;
+						if (zoom_sensitivity_ratio_mouse->GetFloat() != 2.0f)
+							zoom_sensitivity_ratio_mouse->SetValue(2.0f);
+					}
+				}*/
+			}
+		}
+
+		Source::m_pClientModeSwap->VCall<Fn>(Index::IBaseClientDLL::OverrideView)(ecx, vsView);
+	}
+
+	bool __fastcall DoPostScreenEffects(void* clientmode, void*, int a1)
+	{
+		matrix3x4_t backup[128];
+		//float pre_pose = 0.f;
+
+		if (cheat::main::local() && Source::m_pClientState->m_iDeltaTick > 0 && cheat::Cvars.Visuals_lglow.GetValue() && ((int*)(uintptr_t(cheat::main::local()) + 0x64)) != nullptr && (*(int*)(uintptr_t(cheat::main::local()) + 0x64) < 64 && *(int*)(uintptr_t(cheat::main::local()) + 0x64) >= 0) && cheat::main::local()->GetClientClass()) {
+			//if (cheat::main::local() && !cheat::main::local()->IsDead())
+			//	cheat::features::antiaimbot.last_pre_origin = cheat::main::local()->get_abs_origin();
+
+			if (cheat::main::local() && !cheat::main::local()->IsDead() /*&& !cheat::main::called_chams_render*/) {
+				//if (cheat::main::local()->m_vecVelocity().Length2D() > 0.1f)
+				//	cheat::main::local()->set_abs_origin(cheat::features::antiaimbot.last_sent_origin);
+
+				if (!cheat::features::antiaimbot.no_aas)
+					memcpy(backup, cheat::main::local()->m_CachedBoneData().Base(), sizeof(matrix3x4_t) * cheat::main::local()->GetBoneCount());
+
+				memcpy(cheat::main::local()->m_CachedBoneData().Base(), cheat::features::antiaimbot.last_sent_matrix, sizeof(matrix3x4_t) * cheat::main::local()->GetBoneCount());
+			}
+		}
+
+		using Fn = bool(__thiscall*)(void*, int);
+		auto penis = Source::m_pClientModeSwap->VCall<Fn>(44)(clientmode, a1);
+
+		if (cheat::main::local() && Source::m_pClientState->m_iDeltaTick > 0 && cheat::main::local() && !cheat::main::local()->IsDead() && cheat::Cvars.Visuals_lglow.GetValue() && ((int*)(uintptr_t(cheat::main::local()) + 0x64)) != nullptr && (*(int*)(uintptr_t(cheat::main::local()) + 0x64) < 64 && *(int*)(uintptr_t(cheat::main::local()) + 0x64) >= 0) && cheat::main::local()->GetClientClass()) {
+		//	cheat::main::local()->set_abs_origin(cheat::features::antiaimbot.last_pre_origin);
+		//	cheat::main::local()->set_abs_angles(QAngle(0, cheat::features::antiaimbot.visual_real_angle.y, 0));
+
+		//	//cheat::main::local()->m_flPoseParameter()[11] = pre_pose;
+		//	//Source::m_pPrediction->SetLocalViewAngles(cheat::main::local()->m_angEyeAngles());
+			memcpy(cheat::main::local()->m_CachedBoneData().Base(), backup, sizeof(matrix3x4_t) * cheat::main::local()->GetBoneCount());
+		}
+
+		return penis;
+	}
+}

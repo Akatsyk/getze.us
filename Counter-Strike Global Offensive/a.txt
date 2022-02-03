@@ -1,0 +1,67 @@
+bool __fastcall WriteUsercmdDeltaToBuffer(void* ecx, void* edx, int slot, void* buffer, int from, int to, bool new_cmd)
+	{
+		bool result = 0;
+		CUserCmd cmd2; // [esp+FB0h] [ebp-100h]
+		CUserCmd cmd1; // [esp+1018h] [ebp-98h]
+
+		using Fn = bool(__thiscall*)(void*, int, void *, int, int, bool);
+		static auto ofc = Source::m_pClientSwap->VCall<Fn>(24);
+
+		uintptr_t framePtr;
+		__asm mov framePtr, ebp;
+		auto msg = reinterpret_cast<CCLCMsg_Move_t*>(framePtr + 0xFCC);
+		int a67 = *reinterpret_cast<int*>(framePtr + 0xFDC);
+		const auto shift_amount = ctx.shift_amount;
+		if (shift_amount >= 0)
+			return ofc(ecx, slot, buffer, from, to, new_cmd);
+		if (from != -1)
+			return 1;
+		ctx.shift_amount = 0;
+		msg->m_nBackupCommands = 0;
+		const auto v56 = msg->m_nNewCommands;
+			auto v11 = abs(shift_amount) + v56;
+		if (v11 > 62)
+			v11 = 62;
+		auto _from = -1;
+		msg->m_nNewCommands = v11;
+		const auto v57 = csgo.m_client_state()->m_iChockedCommands + csgo.m_client_state()->m_iLastOutgoingCommand + 1;
+		auto v13 = v57 - v56 + 1;
+		if (v13 > v57)
+		{
+		LABEL_10:
+			CUserCmd* v16 = csgo.m_input()->GetUserCmd(_from);
+
+			if (v16)
+			{
+				memcpy(&cmd1, v16, sizeof(CUserCmd));
+				memcpy(&cmd2, v16, sizeof(CUserCmd));
+				++cmd2.command_number;
+				cmd2.tick_count += 192;
+				if (v56 <= v11)
+				{
+					auto v18 = v11 - v56 + 1;
+					do
+					{
+						WriteUsercmd(buffer, &cmd2, &cmd1);
+						cmd1 = cmd2;
+						++cmd2.command_number;
+						++cmd2.tick_count;
+						--v18;
+					} while (v18);
+				}
+			}
+			result = 1;
+		}
+		else
+		{
+			while (ofc(ecx, slot, buffer, _from, v13, 1))
+			{
+				_from = v13++;
+				if (v13 > v57)
+					goto LABEL_10;
+			}
+			result = 0;
+		}
+
+		return result;
+	}

@@ -1,0 +1,1811 @@
+#include "rage_aimbot.hpp"
+#include "source.hpp"
+#include "entity.hpp"
+#include "player.hpp"
+#include "weapon.hpp"
+#include "hooked.hpp"
+#include "math.hpp"
+#include "displacement.hpp"
+#include "lag_comp.hpp"
+#include "anti_aimbot.hpp"
+#include "resolver.hpp"
+#include "visuals.hpp"
+#include "menu.hpp"
+#include "movement.hpp"
+#include "prediction.hpp"
+#include "autowall.hpp"
+#include "misc.hpp"
+#include "thread/threading.h"
+#include "thread/shared_mutex.h"
+
+#include <thread>
+
+static constexpr auto total_seeds = 128;
+
+struct TargetListing_t
+{
+	TargetListing_t(C_BasePlayer* ent)
+	{
+		entity = ent;
+
+		hp = entity->m_iHealth();
+		distance = ctx.m_local()->get_abs_origin().Distance(entity->get_abs_origin());
+		height = (ctx.m_local()->m_vecOrigin().z - entity->m_vecOrigin().z);
+		Vector lol;
+		if (Drawing::WorldToScreen(entity->get_abs_origin(), lol))
+			fov = Vector(ctx.screen_size.x * 0.5f, ctx.screen_size.y * 0.5f, 0).DistanceSquared(lol);
+		else
+			fov = 9999.f;
+		idx = entity->entindex();
+		auto& log = feature::lagcomp.records[idx - 1];
+
+		if (log.best_record)
+		{
+			last_delta = log.best_record->desync_delta;
+
+			if (log.best_record->shot_this_tick)
+				last_delta = 1.f;
+		}
+	}
+	//{ "distance", "crosshair", "damage", "health", "lag", "height" }
+	TargetListing_t()
+	{
+		hp = -1;
+		idx = -1;
+		distance = -1;
+		fov = -1;
+		strange = false;
+		entity = nullptr;
+	}
+
+	float height = 0.f;
+	float last_delta = 60.f;
+	int hp = -1;
+	int idx = -1;
+	int distance = -1;
+	int fov = -1;
+	bool strange = false;
+	C_BasePlayer* entity = nullptr;
+};
+
+std::vector<TargetListing_t> m_entities;
+
+void c_aimbot::get_hitbox_data(C_Hitbox* rtn, C_BasePlayer* ent, int ihitbox, matrix3x4_t* matrix)
+{
+	if (ihitbox < 0 || ihitbox > 19) return;
+
+	if (!ent) return;
+
+	const auto model = ent->GetModel();
+
+	if (!model)
+		return;
+
+	auto pStudioHdr = csgo.m_model_info()->GetStudioModel(model);
+
+	if (!pStudioHdr)
+		return;
+
+	auto hitbox = pStudioHdr->pHitbox(ihitbox, ent->m_nHitboxSet());
+
+	if (!hitbox)
+		return;
+
+	const auto is_capsule = hitbox->radius != -1.f;
+
+	Vector min, max;
+	if (is_capsule) {
+		Math::VectorTransform(hitbox->bbmin, matrix[hitbox->bone], min);
+		Math::VectorTransform(hitbox->bbmax, matrix[hitbox->bone], max);
+	}
+	else
+	{
+		min = hitbox->bbmin;
+		max = hitbox->bbmax;
+		//Math::VectorTransform(Math::VectorRotate(hitbox->bbmin, hitbox->rotation), matrix[hitbox->bone], min);
+		//Math::VectorTransform(Math::VectorRotate(hitbox->bbmax, hitbox->rotation), matrix[hitbox->bone], max);
+	}
+
+	rtn->hitboxID = ihitbox;
+	rtn->isOBB = hitbox->radius < 0.f;
+	rtn->radius = hitbox->radius;
+	rtn->mins = min;
+	rtn->maxs = max;
+	rtn->bone = hitbox->bone;
+}
+
+//bool c_aimbot::safe_static_point(C_BasePlayer* entity, Vector eye_pos, Vector aim_point, int hitboxIdx)
+//{
+//	auto resolve_info = &feature::resolver.player_records[entity->entindex() - 1];
+//	auto log = &feature::lagcomp.records[entity->entindex() - 1];
+//
+//	if (!log->best_record->shot_this_tick)
+//		return true;
+//
+//	const auto is_colliding = [entity, hitboxIdx](Vector start, Vector end, C_Hitbox box) -> bool
+//	{
+//		//cheat::features::lagcomp.apply_record_data(entity, rec);
+//		const auto is_intersecting = box.isOBB ? Math::IntersectBB(start, end, box.mins, box.maxs) : Math::Intersect(start, end, box.mins, box.maxs, box.radius);
+//		//Source::m_pEngineTrace->ClipRayToEntity(ray, MASK_SHOT | CONTENTS_GRATE, entity, &tr);
+//		//const auto walldamage = cheat::features::autowall.CanHit(start, end, cheat::main::local(), entity, hitboxIdx);
+//		//cheat::features::lagcomp.apply_record_data(entity, orgtc);
+//
+//		return is_intersecting;
+//	};
+//
+//	/*Vector angles, direction;
+//	auto v6 = aim_point - eye_pos;
+//	Math::VectorAngles(v6, angles);
+//	Math::AngleVectors(angles, &direction);
+//	direction.Normalize();
+//	const auto end_point = direction * 8092.f + eye_pos;*/
+//	const auto angle = Math::CalcAngle(eye_pos, aim_point);
+//	Vector forward;
+//	Math::AngleVectors(angle, &forward);
+//	auto end = eye_pos + forward * 8092.f;
+//
+//	//Source::m_pDebugOverlay->AddLineOverlay(eye_pos, end, 255, 0, 0, false, Source::m_pGlobalVars->interval_per_tick * 2.f);
+//
+//	C_Hitbox box1; get_hitbox_data(&box1, entity, hitboxIdx, log->best_record->leftlmatrixes);
+//	C_Hitbox box2; get_hitbox_data(&box2, entity, hitboxIdx, log->best_record->rightlmatrixes);
+//
+//	if (box1.isOBB || box2.isOBB)
+//		return true;
+//
+//	//C_Tickrecord rec;
+//	//cheat::features::lagcomp.store_record_data(entity, &rec);
+//
+//	if (is_colliding(eye_pos, end, box2))
+//		return true;
+//	if (is_colliding(eye_pos, end, box1))//is_colliding(eye_pos, end_point, &resolve_info->leftlrec, &rec))
+//		return true;
+//
+//	return false;
+//}
+
+Vector c_aimbot::get_hitbox(C_BasePlayer* ent, int ihitbox, matrix3x4_t mat[])
+{
+	if (ihitbox < 0 || ihitbox > 19) return Vector::Zero;
+
+	if (!ent) return Vector::Zero;
+
+	if (!ent->GetClientRenderable())
+		return Vector::Zero;
+
+	const auto model = ent->GetModel();
+
+	if (!model)
+		return Vector::Zero;
+
+	auto pStudioHdr = csgo.m_model_info()->GetStudioModel(model);
+
+	if (!pStudioHdr)
+		return Vector::Zero;
+
+	auto hitbox = pStudioHdr->pHitbox(ihitbox, ent->m_nHitboxSet());
+
+	if (!hitbox)
+		return Vector::Zero;
+
+	if (hitbox->bone > 128 || hitbox->bone < 0)
+		return Vector::Zero;
+
+	Vector min, max;
+	Math::VectorTransform(hitbox->bbmin, mat[hitbox->bone], min);
+	Math::VectorTransform(hitbox->bbmax, mat[hitbox->bone], max);
+
+	auto center = (min + max) / 2.f;
+
+	return center;
+}
+
+//float c_aimbot::can_hit(int hitbox, C_BasePlayer* Entity, Vector position, matrix3x4_t mx[], bool check_center, bool predict)
+//{
+//	static auto is_visible = [](C_BasePlayer* thisptr, Vector& Start, Vector& End) -> bool
+//	{
+//		if (!thisptr) return NULL;
+//
+//		CGameTrace tr;
+//		Ray_t ray;
+//		static CTraceFilter traceFilter;
+//		traceFilter.pSkip = ctx.m_local();
+//
+//		ray.Init(Start, End);
+//
+//		Source::m_pEngineTrace->TraceRay(ray, MASK_SHOT_HULL | CONTENTS_HITBOX, &traceFilter, &tr);
+//		cheat::features::autowall.FixTraceRay(Start, End, &tr, thisptr);
+//
+//		return (tr.m_pEnt == thisptr || tr.fraction > 0.99f);
+//	};
+//
+//	auto local_weapon = (C_WeaponCSBaseGun*)(csgo.m_entity_list()->GetClientEntityFromHandle(ctx.m_local()->m_hActiveWeapon()));
+//
+//	if (!local_weapon->GetCSWeaponData())
+//		return 0;
+//
+//	auto eyepos = ctx.m_local()->GetEyePosition();
+//
+//	auto cdmg = cheat::features::autowall.CanHit(eyepos, position, ctx.m_local(), Entity, hitbox);
+//
+//	auto nob = (Entity->m_iHealth() < cheat::Cvars.RageBot_MinDamage.GetValue() && cheat::Cvars.RageBot_ScaledmgOnHp.GetValue() ? Entity->m_iHealth() : ((cheat::Cvars.RageBot_MinDmgKey.GetValue() && cheat::game::pressed_keys[(int)cheat::Cvars.RageBot_MinDmgKey.GetValue()]) ? cheat::Cvars.RageBot_MinDamage.GetValue() : cheat::Cvars.RageBot_MinDmgKey_val.GetValue()));
+//
+//	if (check_center) {
+//		if (cdmg >= nob)
+//			return cdmg;
+//
+//		return 0.f;
+//	}
+//
+//	static std::vector<Vector> points;
+//
+//	if (Entity->get_multipoints(hitbox, points, mx) && !points.empty())
+//	{
+//		cheat::main::points[Entity->entindex() - 1][hitbox] = points;
+//
+//		//if (cdmg >= nob)
+//		//	return cdmg;
+//
+//		if (hitbox != 11 && hitbox != 12)
+//		{
+//
+//			//auto dmg = cheat::features::autowall.CanHit(eyepos, points.at(1), ctx.m_local(), Entity, hitbox);
+//			//auto dmg2 = cheat::features::autowall.CanHit(eyepos, points.at(2), ctx.m_local(), Entity, hitbox);
+//			//auto dmg3 = cheat::features::autowall.CanHit(eyepos, points.at(3), ctx.m_local(), Entity, hitbox);
+//
+//			if (hitbox == 0) {
+//				auto dmg = cheat::features::autowall.CanHit(eyepos, points.at(1), ctx.m_local(), Entity, hitbox);
+//				auto dmg2 = cheat::features::autowall.CanHit(eyepos, points.at(4), ctx.m_local(), Entity, hitbox);
+//				auto dmg3 = cheat::features::autowall.CanHit(eyepos, points.at(3), ctx.m_local(), Entity, hitbox);
+//
+//				if (max(dmg, max(dmg2, dmg3)) >= nob)
+//					return dmg;
+//			}
+//			else
+//			{
+//				auto dmg = cheat::features::autowall.CanHit(eyepos, points.at(1), ctx.m_local(), Entity, hitbox);
+//				auto dmg2 = cheat::features::autowall.CanHit(eyepos, points.at(6), ctx.m_local(), Entity, hitbox);
+//				auto dmg3 = cheat::features::autowall.CanHit(eyepos, points.at(4), ctx.m_local(), Entity, hitbox);
+//
+//				//auto dmg = cheat::features::autowall.CanHit(eyepos, points.at(1), ctx.m_local(), Entity, hitbox);
+//				//auto dmg2 = cheat::features::autowall.CanHit(eyepos, points.at(2), ctx.m_local(), Entity, hitbox);
+//				//auto dmg3 = cheat::features::autowall.CanHit(eyepos, points.at(3), ctx.m_local(), Entity, hitbox);
+//
+//				if (max(dmg, max(dmg2, dmg3)) >= nob)
+//					return dmg;
+//			}
+//		}
+//		else
+//		{
+//			auto dmg1 = cheat::features::autowall.CanHit(eyepos, points.at(0), ctx.m_local(), Entity, hitbox);
+//			auto dmg2 = cheat::features::autowall.CanHit(eyepos, points.at(1), ctx.m_local(), Entity, hitbox);
+//
+//			if (max(dmg1, dmg2) >= nob)
+//				return max(dmg1, dmg2);
+//		}
+//	}
+//
+//	if (cdmg >= nob)
+//		return cdmg;
+//
+//	return 0;
+//}
+
+int low_count = 0;
+
+void c_aimbot::build_seed_table()
+{
+	//static DWORD get_shotgun_spread = Memory::Scan("client_panorama.dll", "55 8B EC 83 EC 10 56 8B 75 08 8D");
+	//static auto weapon_accuracy_shotgun_spread_patterns = csgo.m_engine_cvars()->FindVar("weapon_accuracy_shotgun_spread_patterns");
+
+	if (precomputed_seeds.size() >= total_seeds)
+		return;
+
+	for (auto i = 0; i < total_seeds; i++) {
+
+		if (precomputed_seeds.size() >= total_seeds)
+			break;
+
+		RandomSeed(seeds[min(127,i)]);
+
+		auto a = RandomFloat(0.0f, 6.2831855f);
+		auto c = RandomFloat(0.0f, 1.0f);
+		auto b = RandomFloat(0.0f, 6.2831855f);
+
+		/*int id = m_weapon()->m_iItemDefinitionIndex();
+		auto recoil_index = m_weapon()->m_flRecoilIndex();
+
+		if (id == 28 && recoil_index < 3.0f)
+		{
+			for (int i = 3; i > recoil_index; i--)
+				c *= c;
+
+			c = 1.0f - c;
+		}
+
+		if (m_weapon()->IsShotgun() && weapon_accuracy_shotgun_spread_patterns->GetInt())
+		{
+			auto _get_shotgun_spread = reinterpret_cast<void(__stdcall*)(int, int, unsigned int, float*, float*)>(get_shotgun_spread);
+
+			if (_get_shotgun_spread)
+				_get_shotgun_spread(m_weapon()->m_iItemDefinitionIndex(), 0, i + m_weapon()->GetCSWeaponData()->max_speed * recoil_index, &c, &a);
+		}*/
+
+		precomputed_seeds.emplace_back(c,
+			sin(a), cos(b), sin(b), cos(a));
+	}
+}
+
+int mini_low_count = 0;
+
+void c_aimbot::build_mini_hc_table()
+{
+	if (precomputed_mini_seeds.size() >= (total_seeds / 4))
+		return;
+
+	for (auto i = 0; i < 64; i++) {
+
+		if (precomputed_mini_seeds.size() >= 64)
+			break;
+
+		RandomSeed(seeds[min(127 - i / 2, 64 + i)]);
+
+		const auto pi_seed = RandomFloat(0.0f, 6.2831855f);
+		const auto rand = RandomFloat(0.0f, 1.0f);
+
+		/*if (rand <= 0.3f) {
+			if (mini_low_count > ((total_seeds / 4) / 3))
+				continue;
+			else
+				mini_low_count++;
+		}*/
+
+		precomputed_mini_seeds.emplace_back(rand,
+			sin(pi_seed), cos(pi_seed));
+	}
+}
+
+bool c_aimbot::mini_hit_chance(QAngle angle, C_BasePlayer* ent, int hitbox, int& hc)
+{
+	build_mini_hc_table();
+
+	C_Hitbox ht;
+	get_hitbox_data(&ht, ent, hitbox, ent->m_CachedBoneData().Base());
+
+	int traces_hit = 0;
+	int awalls_hit = 0;
+
+	Vector forward, right, up;
+	auto eye_position = ctx.m_local()->GetEyePosition();
+	Math::AngleVectors(angle, &forward, &right, &up); // maybe add an option to not account for punch.
+
+	auto weapon = ctx.m_local()->get_weapon();
+
+	if (!weapon || !weapon->GetCSWeaponData())
+		return false;
+
+	weapon->UpdateAccuracyPenalty();
+	const float weap_spread = weapon->GetSpread();
+	const float weap_inaccuracy = weapon->GetInaccuracy();// +min(ctx.m_local()->m_vecVelocity().Length2D() / 1500.f, 0.0005f);
+
+	if (weap_inaccuracy == 0.f)
+		return true;
+
+	if (precomputed_mini_seeds.empty())
+		return false;
+
+	Vector total_spread, spread_angle, end;
+	float inaccuracy, spread_x, spread_y;
+	std::tuple<float, float, float>* seed;
+
+	for (int i = 0; i < 64; i++)
+	{
+		// get seed.
+		seed = &precomputed_mini_seeds[i];
+
+		// calculate spread.
+		inaccuracy = std::get<0>(*seed) * weap_inaccuracy;
+		spread_x = std::get<2>(*seed) * inaccuracy;
+		spread_y = std::get<1>(*seed) * inaccuracy;
+		total_spread = (forward + right * spread_x + up * spread_y);
+
+		// calculate angle with spread applied.
+		Math::VectorAngles(total_spread, spread_angle);
+
+		// calculate end point of trace.
+		Math::AngleVectors(spread_angle, &end);
+		end = eye_position + end * 8092.f;
+
+		bool intersect = false;
+
+		if (ht.isOBB) {
+			trace_t ll;
+			Ray_t rr;
+			rr.Init(eye_position, end);
+
+			csgo.m_engine_trace()->ClipRayToEntity(rr, MASK_PLAYERSOLID | CONTENTS_HITBOX, ent, &ll);
+
+			intersect = (ll.m_pEnt == ent);
+		}
+		else
+		{
+			intersect = Math::Intersect(eye_position, end, ht.mins, ht.maxs, ht.radius);
+
+			if (intersect && i % 2 == 0)
+				intersect = feature::autowall.CanHit(eye_position, end, ctx.m_local(), ent, hitbox) > 1;
+		}
+
+		//csgo.m_debug_overlay()->AddLineOverlay(eye_position, end, 255, 0, 0, false, csgo.m_globals()->interval_per_tick * 2.f);
+
+		if (intersect)
+			++traces_hit;
+	}
+
+	hc = int(traces_hit * 1.5625f);
+
+	return true;
+}
+
+int hitbox2hitgroup(int Hitbox)
+{
+	switch (Hitbox)
+	{
+	case HITBOX_HEAD:
+	case HITBOX_NECK:
+		return HITGROUP_HEAD;
+	case HITBOX_UPPER_CHEST:
+	case HITBOX_CHEST:
+	case HITBOX_THORAX:
+	case HITBOX_LEFT_UPPER_ARM:
+	case HITBOX_RIGHT_UPPER_ARM:
+		return HITGROUP_CHEST;
+	case HITBOX_PELVIS:
+	case HITBOX_LEFT_THIGH:
+	case HITBOX_RIGHT_THIGH:
+	case HITBOX_BODY:
+		return HITGROUP_STOMACH;
+	case HITBOX_LEFT_CALF:
+	case HITBOX_LEFT_FOOT:
+		return HITGROUP_LEFTLEG;
+	case HITBOX_RIGHT_CALF:
+	case HITBOX_RIGHT_FOOT:
+		return HITGROUP_RIGHTLEG;
+	case HITBOX_LEFT_FOREARM:
+	case HITBOX_LEFT_HAND:
+		return HITGROUP_LEFTARM;
+	case HITBOX_RIGHT_FOREARM:
+	case HITBOX_RIGHT_HAND:
+		return HITGROUP_RIGHTARM;
+	//case HITBOX_NECK:
+	//	return HITGROUP_GEAR;
+	default:
+		return HITGROUP_STOMACH;
+	}
+}
+
+bool c_aimbot::hit_chance(QAngle angle, C_BasePlayer* ent, float chance, int hitbox, float damage, int& hc)
+{
+	float POINT_SCALE = 60.f;//(r.has_been_resolved ? ctx.m_settings.aimbot_resolved_pointscale : ctx.m_settings.aimbot_pointscale) * 0.01f;
+
+	switch (hitbox)
+	{
+	case HITBOX_HEAD:
+	case HITBOX_NECK:
+		POINT_SCALE = float(ctx.m_settings.aimbot_pointscale[0]);
+		break;
+	case HITBOX_CHEST:
+	case HITBOX_UPPER_CHEST:
+		POINT_SCALE = float(ctx.m_settings.aimbot_pointscale[1]);
+		break;
+	case HITBOX_PELVIS:
+	case HITBOX_BODY:
+	case HITBOX_THORAX:
+		POINT_SCALE = float(ctx.m_settings.aimbot_pointscale[2]);
+		break;
+	case HITBOX_RIGHT_THIGH:
+	case HITBOX_LEFT_THIGH:
+	case HITBOX_RIGHT_CALF:
+	case HITBOX_LEFT_CALF:
+		POINT_SCALE = float(ctx.m_settings.aimbot_pointscale[3]);
+		break;
+	case HITBOX_RIGHT_FOOT:
+	case HITBOX_LEFT_FOOT:
+		POINT_SCALE = float(ctx.m_settings.aimbot_pointscale[4]);
+		break;
+	default:
+		break;
+	}
+
+	POINT_SCALE *= 0.01f;
+
+	static float last_innacc = 0.f;
+
+	build_seed_table();
+
+	//C_Hitbox ht;
+	//get_hitbox_data(&ht, ent, hitbox, ent->m_CachedBoneData().Base());
+
+	int traces_hit = 0;
+	int awalls_hit = 0;
+
+	Vector forward, right, up;
+	auto eye_position = ctx.m_local()->GetEyePosition();
+	Math::AngleVectors(angle/* - ctx.m_local()->m_aimPunchAngle()*/, &forward, &right, &up);
+
+	auto weapon = ctx.m_local()->get_weapon();
+
+	if (!weapon || !weapon->GetCSWeaponData())
+		return false;
+
+	weapon->UpdateAccuracyPenalty();
+	const float weap_spread = weapon->GetSpread();
+	const float weap_inaccuracy = weapon->GetInaccuracy();
+
+	if (weap_inaccuracy == 0.f || chance <= 0.0f)
+		return true;
+
+	if (ctx.m_local()->m_iShotsFired() > 0 && (weap_inaccuracy - last_innacc) > 0.0015f)
+		return false;
+
+	if (precomputed_seeds.empty())
+		return false;
+
+	Vector end;
+	//float inaccuracy, spread_x, spread_y;
+	std::tuple<float, float, float, float, float>* seed;
+
+	for (int i = 0; i < total_seeds; i++)
+	{
+		// get seed.
+		seed = &precomputed_seeds[i];
+
+		auto c = std::get<0>(*seed);
+		const auto spread_val = c * weap_spread;
+		const auto inaccuracy_val = c * weap_inaccuracy;
+
+		Vector v_spread((std::get<2>(*seed) * spread_val) + (std::get<4>(*seed) * inaccuracy_val), (std::get<3>(*seed) * spread_val) + (std::get<1>(*seed) * inaccuracy_val), 0);
+		Vector dir;
+
+		//dir.x = forward.x + (right.x * v_spread.x) + (up.x * v_spread.y);
+		//dir.y = forward.y + (right.y * v_spread.x) + (up.y * v_spread.y);
+		//dir.z = forward.z + (right.z * v_spread.x) + (up.z * v_spread.y);
+
+		//Vector spread_view;
+		//Math::VectorAngles(dir, spread_view);
+		////spread_view.Normalize();
+		//Math::AngleVectors(spread_view, &end);
+
+		dir.x = forward.x + (v_spread.x * right.x) + (v_spread.y * up.x);
+		dir.y = forward.y + (v_spread.x * right.y) + (v_spread.y * up.y);
+		dir.z = forward.z + (v_spread.x * right.z) + (v_spread.y * up.z);
+		dir.Normalized();
+		//proper
+		auto end = eye_position + (dir * weapon->GetCSWeaponData()->range);
+
+		bool intersect = false;
+
+		//if (ht.isOBB) 
+		//{
+			trace_t ll;
+			Ray_t rr;
+			rr.Init(eye_position, end);
+
+			csgo.m_engine_trace()->ClipRayToEntity(rr, 0x4600400B, ent, &ll);
+
+			bool can_damage = (ll.hitgroup >= 0 && ll.hitgroup <= 8);
+			bool is_required_player = (ll.m_pEnt == ent);
+
+			intersect = can_damage && is_required_player/*== hitbox2hitgroup(hitbox)*/;
+		//}
+		//else
+		//{
+		//	intersect = Math::Intersect(eye_position, end, ht.mins, ht.maxs, (ht.radius * 0.85f));
+		//}
+
+		if (intersect) {
+			//++traces_hit;
+
+			if (/*ctx.m_settings.aimbot_accuracy_boost > 0.f && */feature::autowall.CanHit(eye_position, end, ctx.m_local(), ent, hitbox) >= max(1, damage))
+				++traces_hit;
+		}
+
+		//csgo.m_debug_overlay()->AddLineOverlay(eye_position, end, 255, (i <= 64 ? 0 : 255), 0, false, csgo.m_globals()->interval_per_tick * 2.f);
+
+		if (((static_cast<float>(traces_hit) / static_cast<float>(total_seeds)) >= (chance / 100.f)))
+		//{
+			//if (((static_cast<float>(awalls_hit) / static_cast<float>(total_seeds)) >= float(ctx.m_settings.aimbot_accuracy_boost / 100.f)) || ctx.m_settings.aimbot_accuracy_boost <= 1)
+				return true;
+		//}
+
+		// abort if we can no longer reach hitchance.
+		if (((static_cast<float>(traces_hit + total_seeds - i) / static_cast<float>(total_seeds)) < (chance / 100.f)))
+			break;
+	}
+
+	last_innacc = weap_inaccuracy;
+
+	return ((static_cast<float>(traces_hit) / static_cast<float>(total_seeds)) >= (chance / 100.f));
+}
+
+float c_aimbot::can_hit(int hitbox, C_BasePlayer* entity, Vector position, matrix3x4_t mx[], bool* was_viable)
+{
+	auto local_weapon = m_weapon();
+
+	if (!local_weapon->GetCSWeaponData())
+		return 0;
+
+	auto eyepos = ctx.m_local()->GetEyePosition();
+
+	//auto nob = (entity->m_iHealth() < ctx.m_settings.aimbot_min_damage ? entity->m_iHealth() : ctx.m_settings.aimbot_min_damage);
+
+	static std::vector<Vector> points;
+	bool only_center = false;
+
+	if (entity->get_multipoints(hitbox, points, mx, only_center) && !points.empty())
+	{
+		ctx.points[entity->entindex() - 1][hitbox] = points;
+
+		if (only_center)
+			return feature::autowall.CanHit(eyepos, position, ctx.m_local(), entity, hitbox, was_viable);
+
+		if (hitbox != 11 && hitbox != 12)
+		{
+			//if (hitbox <= 1) {
+
+			bool bdmg1 = false, bdmg2 = false, bdmg3 = false;
+
+			auto dmg = feature::autowall.CanHit(eyepos, points.at(0), ctx.m_local(), entity, hitbox, &bdmg1);
+			auto dmg2 = feature::autowall.CanHit(eyepos, points.at(2), ctx.m_local(), entity, hitbox, &bdmg2);
+			auto dmg3 = feature::autowall.CanHit(eyepos, points.at(3), ctx.m_local(), entity, hitbox, &bdmg3);
+			//auto dmg = feature::autowall.CanHit(eyepos, points.at(1), ctx.m_local(), entity, hitbox, was_viable);
+			//auto dmg2 = feature::autowall.CanHit(eyepos, points.at(4), ctx.m_local(), entity, hitbox, was_viable);
+			//auto dmg3 = feature::autowall.CanHit(eyepos, points.at(3), ctx.m_local(), entity, hitbox, was_viable);
+
+			bool max_viable = dmg > dmg2 ? (dmg > dmg3 ? bdmg1 : dmg3) : (dmg2 > dmg3 ? bdmg2 : dmg3);
+
+			if (was_viable)
+				*was_viable = max_viable;
+
+			return max(dmg, max(dmg2, dmg3));
+			//}
+			//else
+			//{
+			//	auto dmg = feature::autowall.CanHit(eyepos, points.at(1), ctx.m_local(), entity, hitbox, was_viable);
+			//	auto dmg2 = feature::autowall.CanHit(eyepos, points.at(2), ctx.m_local(), entity, hitbox, was_viable);
+			//	//auto dmg3 = feature::autowall.CanHit(eyepos, points.at(4), ctx.m_local(), entity, hitbox);
+
+			//	return max(dmg, dmg2);
+			//}
+		}
+		else
+		{
+			auto dmg1 = feature::autowall.CanHit(eyepos, points.at(0), ctx.m_local(), entity, hitbox, was_viable);
+			auto dmg2 = feature::autowall.CanHit(eyepos, points.at(1), ctx.m_local(), entity, hitbox, was_viable);
+
+			return max(dmg1, dmg2);
+		}
+	}
+
+	return 0;
+}
+
+void c_aimbot::visualize_hitboxes(C_BasePlayer* entity, matrix3x4_t* mx, Color color, float time)
+{
+	auto model = entity->GetModel();
+
+	if (!model)
+		return;
+
+	auto studioHdr = csgo.m_model_info()->GetStudioModel(model);
+
+	if (!studioHdr)
+		return;
+
+	auto set = studioHdr->pHitboxSet(entity->m_nHitboxSet());
+
+	if (!set)
+		return;
+
+	for (int i = 0; i < set->numhitboxes; i++)
+	{
+		auto hitbox = set->pHitbox(i);
+
+		if (!hitbox)
+			continue;
+
+		Vector min, max, center;
+		Math::VectorTransform(hitbox->bbmin, mx[hitbox->bone], min);
+		Math::VectorTransform(hitbox->bbmax, mx[hitbox->bone], max);
+
+		if (hitbox->radius != -1)
+			csgo.m_debug_overlay()->AddCapsuleOverlay(min, max, hitbox->radius, color.r(), color.g(), color.b(), color.a(), time, 0, 1);
+
+	}
+}
+
+void c_aimbot::autostop(CUserCmd* cmd, bool& send_packet, C_WeaponCSBaseGun* local_weapon)
+{
+	static auto accel = csgo.m_engine_cvars()->FindVar("sv_accelerate");
+
+	if (!ctx.m_settings.aimbot_autostop)
+		return;
+
+	static bool was_onground = ctx.m_local()->m_fFlags() & FL_ONGROUND;
+
+	if (ctx.do_autostop && local_weapon && local_weapon->GetCSWeaponData() && was_onground && ctx.m_local()->m_fFlags() & FL_ONGROUND)
+	{
+		auto speed = ((cmd->sidemove * cmd->sidemove) + (cmd->forwardmove * cmd->forwardmove));
+		auto lol = sqrt(speed);
+
+		auto velocity = ctx.m_local()->m_vecVelocity() + (ctx.m_local()->m_vecVelocity() * (csgo.m_globals()->interval_per_tick * TICKS_TO_TIME(csgo.m_client_state()->m_iChockedCommands)));
+		float maxspeed = 30.f;
+
+		if (!ctx.m_local()->m_bIsScoped())
+			maxspeed = *(float*)(uintptr_t(local_weapon->GetCSWeaponData()) + 0x130);
+		else
+			maxspeed = *(float*)(uintptr_t(local_weapon->GetCSWeaponData()) + 0x134);//local_weapon->GetCSWeaponData()->max_speed;
+
+		maxspeed *= 0.33f;
+
+		float max_accelspeed = accel->GetFloat() * csgo.m_globals()->interval_per_tick * maxspeed * ctx.m_local()->m_surfaceFriction();
+		const auto chocked_ticks = abs(ctx.last_sent_tick - csgo.m_globals()->tickcount);
+
+		if (ctx.m_settings.aimbot_autostop_options[0])
+		{
+			cmd->buttons |= IN_SPEED;
+
+			if (velocity.Length2D() > maxspeed)
+			{
+				//	cmd->buttons |= IN_WALK;
+				//Engine::Movement::Instance()->quick_stop(cmd);
+
+				if ((maxspeed + 1.0f) <= velocity.Length2D())
+				{
+					cmd->forwardmove = 0.0f;
+					cmd->sidemove = 0.0f;
+				}
+				else
+				{
+					cmd->sidemove = (maxspeed * (cmd->sidemove / lol));
+					cmd->forwardmove = (maxspeed * (cmd->forwardmove / lol));
+				}
+			}
+		}
+		else
+		{
+			//cmd->buttons |= IN_SPEED;
+			Engine::Movement::Instance()->Quick_stop(cmd);
+		}
+
+		/*Engine::Movement::Instance()->m_qAnglesView.y = RAD2DEG(std::atan2(ctx.m_local()->m_vecVelocity().y, ctx.m_local()->m_vecVelocity().x)) - 180.f;*/
+
+		ctx.do_autostop = false;
+	}
+
+	was_onground = (ctx.m_local()->m_fFlags() & FL_ONGROUND);
+}
+
+std::string hitbox_to_string(int h)
+{
+	switch (h)
+	{
+	case 0:
+		return "head";
+		break;
+	case 1:
+		return "neck";
+		break;
+	case HITBOX_RIGHT_FOOT:
+		return "right foot";
+		break;
+	case HITBOX_LEFT_FOOT:
+		return "left foot";
+		break;
+	case HITBOX_RIGHT_HAND:
+		return "right hand";
+		break;
+	case HITBOX_LEFT_HAND:
+		return "left hand";
+		break;
+	default:
+		return "body";
+		break;
+	}
+}
+
+Vector get_bone(int bone, matrix3x4_t mx[])
+{
+	return Vector(mx[bone][0][3], mx[bone][1][3], mx[bone][2][3]);
+}
+
+struct lagcomp_mt
+{
+	lagcomp_mt() {  };
+	bool job_done = false;
+};
+
+struct aimbot_mt
+{
+	aimbot_mt() {  };
+	bool job_done = false;
+	bool hitchance = false;
+	float max_dmg = 0.f;
+	int walls_penetrated = 0;
+	C_BasePlayer* best_player = nullptr;
+	Vector best_hitbox = Vector::Zero;
+	int	best_hitboxid = -1;
+	QAngle aim_angles = QAngle::Zero;
+};
+
+static int skip_player[64] = {};
+static int players_skipped = 0;
+
+bool c_aimbot::work(CUserCmd* cmd, bool& send_packet)
+{
+	auto fill_players_list = [](void* _data) {
+		lagcomp_mt* data = (lagcomp_mt*)_data;
+
+		data->job_done = false;
+
+		int ppl = 0;
+
+		auto is_zeus = (m_weapon()->m_iItemDefinitionIndex() == WEAPON_TASER);
+		auto neyepos = ctx.m_local()->GetEyePosition();
+
+		if (m_entities.empty())
+		{
+			static auto sv_maxunlag = csgo.m_engine_cvars()->FindVar("sv_maxunlag");
+			for (auto idx = 1; idx < 64; idx++)
+			{
+				auto entity = (C_BasePlayer*)csgo.m_entity_list()->GetClientEntity(idx);
+
+				if (!entity ||
+					!entity->IsPlayer() ||
+					entity->IsDormant() ||
+					entity->m_iHealth() <= 0 ||
+					entity->m_iTeamNum() == ctx.m_local()->m_iTeamNum() ||
+					entity->m_bGunGameImmunity()
+					) continue;
+
+				auto& log = feature::lagcomp.records[idx - 1];
+				auto resolver_info = &feature::resolver.player_records[idx - 1];
+
+				log.best_record = nullptr;
+				log.restore_record.data_filled = false;
+				log.restore_record = C_Tickrecord(entity, true);
+				log.head_position.clear();
+
+				if (!log.player || log.player != entity || log.tick_records.size() <= 1)
+					continue;
+
+				auto had_shot_rec = false;
+				auto had_low_delta = false;
+				auto had_anims_update = false;
+				float best_damage = 1.f;
+				float best_distance = 8196.f;
+				//float best_delta = 60.f;
+				Vector last_hitbox_pos = Vector::Zero;
+
+				/*resolve_info.aimbot_resolve_method = resolve_info.resolving_method;
+
+				if (resolve_info.resolving_method <= 0 && ctx.shots_fired[idx] == 0 && fabs(entity->m_angEyeAngles().x) > 45.f)
+					resolve_info.aimbot_resolve_method = 1;
+
+				if (ctx.shots_fired[idx] > 0)
+				{
+					const auto shots = ((ctx.shots_fired[idx] - 1) % 3);
+
+					switch (shots)
+					{
+					case 0:
+						resolve_info.aimbot_resolve_method = (int(resolve_info.prev_resolving_method != 2) + 1);
+						break;
+					case 1:
+						resolve_info.aimbot_resolve_method = resolve_info.prev_resolving_method;
+						break;
+					case 2:
+						resolve_info.aimbot_resolve_method = 0;
+						break;
+					}
+				}
+				else {
+					if (resolve_info.last_hurt_resolved >= 0)
+						resolve_info.aimbot_resolve_method = resolve_info.last_hurt_resolved;
+				}*/
+
+				int passed_records = 0;
+
+				/*if (log.tick_records[0].valid && !log.tick_records[0].dormant && !log.tick_records[0].exploit) {
+					log.best_record = &log.tick_records[0];
+
+					auto rhead = get_hitbox(entity, HITBOX_HEAD, log.tick_records[0].rightmatrixes);
+					auto lhead = get_hitbox(entity, HITBOX_HEAD, log.tick_records[0].leftmatrixes);
+
+					auto r_damage = feature::autowall.CanHit(ctx.m_local()->GetEyePosition(), rhead, ctx.m_local(), entity, 0);
+					auto l_damage = feature::autowall.CanHit(ctx.m_local()->GetEyePosition(), lhead, ctx.m_local(), entity, 0);
+
+					if (r_damage <= 0.f || l_damage <= 0.f)
+						resolver_info->freestanding_resolver = r_damage < l_damage ? 2 : 1;
+				}*/
+
+				int start = min(int(log.tick_records.size() - 1), int(sv_maxunlag->GetFloat() * 200.f));
+
+				int first_valid_record = start;
+
+				//for (auto& record : log.tick_records)
+				for (auto k = start; k >= 0; k--)
+				{
+					if (k >= int(log.tick_records.size()))
+						continue;
+
+					auto& record = log.tick_records[k];
+
+					if (!record.valid || record.dormant || !record.animated || record.breaking_lc || record.exploit)
+						continue;
+
+					if (feature::lagcomp.is_time_delta_too_large(&record))
+						continue;
+					else
+					{
+						if (first_valid_record >= start)
+							first_valid_record = k;
+					}
+
+					if (ppl > 2)
+					{
+						if (k < (first_valid_record - 1) && k > 1 && (!record.shot_this_tick || ctx.m_settings.aimbot_position_adjustment_old && record.velocity.Length2D() > 0.1f))
+							continue;
+					}
+
+					if (record.rtype == -1 && !is_zeus)
+						continue;
+
+					/*if (resolve_info->resolving_method != record.rtype && resolve_info.resolving_method > 0)
+						continue;*/
+
+					if (resolver_info->resolving_method <= 0 && resolver_info->prev_resolving_method < 0 && ctx.shots_fired[idx - 1] < 1 && abs(record.eye_angles.x) > 45.f/* && abs(previous->eye_angles.x) > 45.f*/)
+						resolver_info->resolving_method = 1;
+
+					const auto shots = (ctx.shots_fired[idx - 1] % 4);
+
+					const auto prev_resolver_type = resolver_info->resolver_type;
+
+					switch (shots)
+					{
+					case 0:
+						if (resolver_info->last_resolving_method > 0) {
+							resolver_info->resolving_method = resolver_info->last_resolving_method;
+							resolver_info->resolver_type = 1;
+						}
+
+						if (resolver_info->last_hurt_resolved > 0) {
+							resolver_info->resolving_method = resolver_info->last_hurt_resolved;
+							resolver_info->resolver_type = 2;
+						}
+
+						if (resolver_info->freestanding_resolver > 0 && !record.shot_this_tick) {
+							resolver_info->resolving_method = resolver_info->freestanding_resolver;
+							resolver_info->resolver_type = 3;
+						}
+
+						if (resolver_info->anims_resolving > 0 /*&& !record->shot_this_tick*/ && record.animations_updated) {
+							resolver_info->resolving_method = resolver_info->anims_resolving;
+							resolver_info->resolver_type = 4;
+						}
+
+						//if (record->shot_this_tick && previous->resolver_type == 3)
+						//	resolver_info->resolving_method = (int(resolver_info->prev_resolving_method != 2) + 1);
+
+						/*if (history.size() > 2 && abs(diff) > (feature::resolver.get_delta(m_player->get_animation_state()) * 0.95f) && !record->animations_updated && history[2].eye_angles.y == previous->eye_angles.y && record->anim_layers[6].m_flWeight <= 0.01f && !record->shot_this_tick)
+						{
+							resolver_info->resolving_method = (diff <= 0.f ? 2 : 1);
+							resolver_info->resolver_type = 3;
+						}*/
+
+						resolver_info->prev_resolving_method = resolver_info->resolving_method;
+						break;
+					case 1:
+						resolver_info->resolving_method = (int(resolver_info->prev_resolving_method != 2) + 1);
+						resolver_info->resolver_type = 5;
+						break;
+					case 2:
+						resolver_info->resolving_method = resolver_info->prev_resolving_method;
+						resolver_info->resolver_type = 5;
+						break;
+					case 3:
+						resolver_info->resolving_method = 0;
+						resolver_info->resolver_type = 5;
+						break;
+					}
+
+					/*if (history.size() > 2 && abs(Math::AngleDiff(previous->eye_angles.y, record->eye_angles.y)) > 90.f && ctx.shots_fired[idx] < 2 && abs(Math::AngleDiff(history[2].eye_angles.y, record->eye_angles.y)) > 90.f && !record->shot_this_tick || record->shot_this_tick)
+					{
+						resolver_info->resolving_method = (int(resolver_info->resolving_method != 2) + 1);
+						resolver_info->resolver_type = 7;
+					}*/
+
+					auto lol = abs(Math::AngleDiff(record.eye_angles.y, record.lower_body_yaw));
+					if (lol > 30.f && record.lag < 14 && ctx.shots_fired[idx - 1] < 2 && !record.shot_this_tick)
+					{
+						/*if (resolver_info->change)
+							resolver_info->resolving_method = (int(resolver_info->prev_resolving_method != 2) + 1);
+
+						resolver_info->change = !resolver_info->change;*/
+
+						//auto delta_1 = abs(Math::AngleDiff(previous->eye_angles.y, resolver_info->simulated_animstates[0].abs_yaw));
+						auto delta_2 = abs(Math::AngleDiff(record.eye_angles.y, resolver_info->simulated_animstates[1].abs_yaw));
+						auto delta_3 = abs(Math::AngleDiff(record.eye_angles.y, resolver_info->simulated_animstates[2].abs_yaw));
+
+						//auto max_delta = max(delta_1, max(delta_2, delta_3));
+
+						/*if (max_delta == delta_1)
+							resolver_info->resolving_method = 0;
+						else
+						{*/
+						if (delta_2 > delta_3)
+							resolver_info->resolving_method = 2;
+						else
+							resolver_info->resolving_method = 1;
+						//}
+
+						/*if (max_delta > max(delta_2, delta_3))
+						{
+							resolver_info->resolving_method = 0;
+						}
+						else if (max_delta > max(delta_2, delta_1))
+						{
+							resolver_info->resolving_method = 2;
+						}
+						else
+						{
+							resolver_info->resolving_method = 1;
+						}*/
+						record.animations_updated = true;
+						resolver_info->resolver_type = 6;
+					}
+
+					if (passed_records > 0 && get_bone(8, record.matrixes).Distance(get_bone(8, log.tick_records[k + 1].matrixes)) < 1.f && (!record.shot_this_tick || ctx.m_settings.aimbot_position_adjustment_old && record.velocity.Length2D() <= 0.1f))
+						continue;
+
+					if (had_shot_rec && (!record.shot_this_tick || ctx.m_settings.aimbot_position_adjustment_old && record.velocity.Length2D() <= 0.1f) && !is_zeus)
+						continue;
+
+					//if (had_low_delta && !record.shot_this_tick && abs(record.desync_delta) > 35.f && !is_zeus)
+					//	continue;
+
+					if (had_anims_update && (record.rtype == log.tick_records[k + 1].rtype || ctx.m_settings.aimbot_position_adjustment_old && record.velocity.Length2D() <= 0.1f) && !record.shot_this_tick && !is_zeus)
+						continue;
+
+					record.apply(entity, false);
+
+					passed_records++;
+
+					const auto head = feature::ragebot.get_hitbox(entity, HITBOX_HEAD, entity->m_CachedBoneData().Base());
+					const auto chest = feature::ragebot.get_hitbox(entity, HITBOX_BODY, entity->m_CachedBoneData().Base());
+
+					auto point_damage = feature::ragebot.can_hit(HITBOX_HEAD, entity, head, entity->m_CachedBoneData().Base());
+
+					if (point_damage <= 1.f && !is_zeus)
+						point_damage = feature::ragebot.can_hit(HITBOX_BODY, entity, chest, entity->m_CachedBoneData().Base());
+
+					auto dist = chest.DistanceSquared(neyepos);
+
+					last_hitbox_pos = record.head_pos;
+
+					if (point_damage > best_damage /*|| ((point_damage >= entity->m_iHealth() || point_damage >= best_damage) && best_delta > record.desync_delta) */ || (is_zeus && best_distance < dist))
+					{
+						best_damage = point_damage;
+						best_distance = dist;
+						//best_delta = record.desync_delta;
+						log.best_record = &record;
+
+						if (record.shot_this_tick)
+							had_shot_rec = true;
+						//else if (fabs(record.desync_delta) <= 35.f)
+						//	had_low_delta = true;
+						else if (start > 2 && record.rtype != log.tick_records[k + 1].rtype)
+							had_anims_update = true;
+					}
+				}
+
+				log.restore_record.apply(entity, true);
+
+				//entity passed all checks and now we can aim at it.
+				if (log.best_record != nullptr) {
+					m_entities.push_back(TargetListing_t(entity));
+					ppl++;
+				}
+			}
+
+			std::sort(m_entities.begin(), m_entities.end(), [&](const TargetListing_t& a, const TargetListing_t& b)
+				{
+					switch (ctx.m_settings.aimbot_target_selection)
+					{
+					case 0:
+						return (a.distance < b.distance);
+						break;
+					case 1:
+						return (a.fov < b.fov);
+						break;
+					case 2:
+						return (a.last_delta < b.last_delta);
+						break;
+					case 3:
+						return (a.hp < b.hp);
+						break;
+					case 4:
+						return (a.height < b.height);
+						break;
+					default:
+						return (a.hp < b.hp);
+						break;
+					}
+				}
+			);
+		}
+
+		data->job_done = true;
+	};
+	auto hitscan_entities = [](void* _data) {
+		aimbot_mt* data = (aimbot_mt*)_data;
+
+		C_BasePlayer* best_player = nullptr;
+		Vector best_hitbox = Vector::Zero;
+		int	best_hitboxid = -1;
+
+		data->job_done = false;
+
+		if (m_entities.empty())
+			return;
+
+		auto local_weapon = m_weapon();
+
+		auto is_zeus = (m_weapon()->m_iItemDefinitionIndex() == WEAPON_TASER);
+		auto neyepos = ctx.m_local()->GetEyePosition();
+
+		auto is_innaccurate = (local_weapon->GetInaccuracy() > 0.015f);
+		int pisun = 0;
+
+		static int hitboxesLoop[] =
+		{
+			HITBOX_HEAD,
+			HITBOX_NECK,
+			HITBOX_PELVIS,
+			HITBOX_BODY,
+			HITBOX_THORAX,
+			HITBOX_CHEST,
+			HITBOX_UPPER_CHEST,
+			HITBOX_RIGHT_THIGH,
+			HITBOX_LEFT_THIGH,
+			HITBOX_RIGHT_CALF,
+			HITBOX_LEFT_CALF,
+			HITBOX_RIGHT_FOOT, //11
+			HITBOX_LEFT_FOOT, //12
+			/*HITBOX_RIGHT_HAND,
+			HITBOX_LEFT_HAND,*/
+			//HITBOX_RIGHT_UPPER_ARM,
+			HITBOX_RIGHT_FOREARM,
+			//HITBOX_LEFT_UPPER_ARM,
+			HITBOX_LEFT_FOREARM
+		};
+
+		float max_damage = 1.f;
+
+		auto bodyaim = ctx.get_key_press(ctx.m_settings.aimbot_bodyaim_key);
+
+		const auto loh = ctx.m_settings.aimbot_hitboxes[0] && (!ctx.m_settings.aimbot_hitboxes[1]
+			&& !ctx.m_settings.aimbot_hitboxes[2]
+			&& !ctx.m_settings.aimbot_hitboxes[3]
+			&& !ctx.m_settings.aimbot_hitboxes[4]
+			&& !ctx.m_settings.aimbot_hitboxes[5]);
+
+		//for (auto k = 1; k < 64; k++)
+		for (auto target : m_entities)
+		{
+			//auto entity = (C_BasePlayer*)csgo.m_entity_list()->GetClientEntity(k);
+			auto entity = target.entity;
+			auto k = target.idx;
+
+			if (!entity ||
+				entity->IsDormant() ||
+				!entity->IsPlayer() ||
+				entity->m_bGunGameImmunity() ||
+				entity->m_iTeamNum() == ctx.m_local()->m_iTeamNum() ||
+				entity->IsDead() ||
+				!entity->GetClientClass())
+			{
+				continue;
+			}
+
+			if (players_skipped >= (m_entities.size() - 1)) {
+				memset(skip_player, 0, sizeof(int) * 64);
+				players_skipped = 0;
+			}
+
+			auto idx = entity->entindex();
+
+			if (!entity->get_animation_state())
+				continue;
+
+			//if (!ctx.double_tapped || ctx.m_settings.aimbot_tickbase_exploit != 2) {
+			if (players_skipped > 0 && skip_player[idx - 1] != 0)
+				continue;
+			//}
+
+			int loopsize = ARRAYSIZE(hitboxesLoop) - 1;
+
+			feature::lagcomp.records[idx - 1].tick_count = -1;
+			feature::lagcomp.records[idx - 1].type = RECORD_NORMAL;
+
+			float maxRange = local_weapon->GetCSWeaponData()->range;
+			auto hp = entity->m_iHealth();
+
+			if (is_zeus)
+				max_damage = entity->m_iHealth() - 0.1f;
+
+			auto resolver_log = &feature::resolver.player_records[idx - 1];
+			auto& log = feature::lagcomp.records[idx - 1];
+
+			Vector head_spot = Vector::Zero;
+
+			pisun++;
+
+			if (log.tick_records.empty() || log.best_record == nullptr || log.player != entity)
+				continue;
+
+			auto distance = log.best_record->origin.Distance(ctx.m_local()->m_vecOrigin());
+
+			if (distance > maxRange || is_zeus && distance > (180.0f - (entity->m_iHealth() / 10.f))) {
+				feature::lagcomp.finish_position_adjustment(entity);
+				continue;
+			}
+
+			log.best_record->apply(entity, false);
+			log.tick_count = TIME_TO_TICKS(log.best_record->simulation_time + ctx.lerp_time);
+			log.backtrack_ticks = csgo.m_globals()->tickcount - TIME_TO_TICKS(log.best_record->simulation_time);
+			log.head_position = feature::ragebot.get_hitbox(entity, HITBOX_HEAD, entity->m_CachedBoneData().Base());
+
+			bool head_was_viable = false;
+			const auto head_damage = feature::ragebot.can_hit(HITBOX_HEAD, entity, log.head_position, entity->m_CachedBoneData().Base(), &head_was_viable);
+
+			bool stomach_was_viable = false;
+			auto hitbox_stomach = feature::ragebot.get_hitbox(entity, HITBOX_BODY, entity->m_CachedBoneData().Base());
+			const auto stomach_damage = feature::ragebot.can_hit(HITBOX_BODY, entity, hitbox_stomach, entity->m_CachedBoneData().Base(), &stomach_was_viable);
+
+			bool chest_was_viable = false;
+			auto hitbox_chest = feature::ragebot.get_hitbox(entity, HITBOX_CHEST, entity->m_CachedBoneData().Base());
+			const auto chest_damage = feature::ragebot.can_hit(HITBOX_CHEST, entity, hitbox_chest, entity->m_CachedBoneData().Base(), &chest_was_viable);
+
+			if (max(head_damage, max(stomach_damage, chest_damage)) <= 0.f && m_entities.size() > 2) {
+				skip_player[idx - 1] = 1;
+				players_skipped++;
+				continue;
+			}
+
+			bool pelvis_was_viable = false;
+			const auto hitbox_pelvis = feature::ragebot.get_hitbox(entity, HITBOX_PELVIS, entity->m_CachedBoneData().Base());
+			const auto pelvis_damage = feature::ragebot.can_hit(HITBOX_PELVIS, entity, hitbox_pelvis, entity->m_CachedBoneData().Base(), &pelvis_was_viable);
+
+			bool neck_was_viable = false;
+			const auto hitbox_neck = feature::ragebot.get_hitbox(entity, HITBOX_NECK, entity->m_CachedBoneData().Base());
+			const auto neck_damage = feature::ragebot.can_hit(HITBOX_NECK, entity, hitbox_neck, entity->m_CachedBoneData().Base(), &neck_was_viable);
+
+			if (is_zeus)
+				loopsize = 5;
+
+			const auto baim_dmg = max(max(stomach_damage, pelvis_damage), chest_damage);
+			//const auto agressive_baim = (baim_dmg > hp || baim_dmg > (hp * 0.5f)) && ctx.m_settings.aimbot_bodyaim == 1;// && (fabs(Math::AngleDiff(resolver_log->original_abs_yaw, entity->get_animation_state()->abs_yaw)) > 22.f && resolver_log->resolving_method != 0);
+
+			auto prefered_hitbox = (ctx.m_settings.aimbot_hitbox == 0 ? HITBOX_HEAD : (ctx.m_settings.aimbot_hitbox == 1 ? HITBOX_NECK : (stomach_damage >= pelvis_damage ? HITBOX_BODY : HITBOX_PELVIS)));
+
+			if (ctx.m_settings.aimbot_prefer_body)
+				prefered_hitbox = (stomach_damage >= pelvis_damage ? HITBOX_BODY : HITBOX_PELVIS);
+
+			auto pred = (ctx.m_local()->GetEyePosition() + (ctx.m_local()->m_vecVelocity() * csgo.m_globals()->interval_per_tick));
+			const auto lol_dmg = feature::autowall.CanHit(pred, hitbox_stomach, ctx.m_local(), entity, HITBOX_BODY);
+			const auto can_baim_next_tick = (lol_dmg > hp || lol_dmg > (hp * 0.5f)) && ctx.m_settings.aimbot_prefer_body && hp < 80.f;
+
+			if (can_baim_next_tick && ctx.m_settings.aimbot_prefer_body)
+				prefered_hitbox = HITBOX_BODY;
+
+			if (ctx.m_settings.aimbot_headaim[0] && log.best_record->shot_this_tick)
+				prefered_hitbox = HITBOX_HEAD;
+			if (ctx.m_settings.aimbot_headaim[1] && (log.best_record->velocity.Length2D() > 150.f || ctx.m_settings.aimbot_position_adjustment_old && log.best_record->velocity.Length2D() > 10.f))
+				prefered_hitbox = HITBOX_HEAD;
+			if (ctx.m_settings.aimbot_headaim[2] && ((log.best_record->desync_delta < 35.f && resolver_log->resolving_method != 0 || ctx.m_settings.aimbot_position_adjustment_old && log.best_record->lag < 1) || entity->IsBot()))
+				prefered_hitbox = HITBOX_HEAD;
+			if (ctx.m_settings.aimbot_headaim[3] && (baim_dmg * 1.4f) < head_damage)
+				prefered_hitbox = HITBOX_HEAD;
+			if (ctx.m_settings.aimbot_headaim[4] && (log.best_record->animations_updated || log.best_record->desync_delta <= 35.f || log.best_record->rtype == resolver_log->last_hurt_resolved) && !log.best_record->corrected_velocity || ctx.m_settings.aimbot_position_adjustment_old && log.best_record->velocity.Length2D() > 0.1f)
+				prefered_hitbox = HITBOX_HEAD;
+
+			C_Hitbox box; feature::ragebot.get_hitbox_data(&box, entity, HITBOX_HEAD, entity->m_CachedBoneData().Base());
+
+			const auto angle = Math::CalcAngle(ctx.m_local()->GetEyePosition(), hitbox_neck);
+			Vector forward;
+			Math::AngleVectors(angle, &forward);
+			auto end = ctx.m_local()->GetEyePosition() + forward * 8096.f;
+
+			if (is_zeus /*|| max(stomach_damage, pelvis_damage) < chest_damage*/ || can_baim_next_tick && ctx.m_settings.aimbot_prefer_body /*|| ctx.m_settings.aimbot_ignore_head*/ || bodyaim)
+				prefered_hitbox = (stomach_damage >= pelvis_damage ? (max(stomach_damage, pelvis_damage) < chest_damage ? HITBOX_CHEST : HITBOX_BODY) : HITBOX_PELVIS);
+
+			if (loh)
+				prefered_hitbox = HITBOX_HEAD;
+
+			if (Math::Intersect(ctx.m_local()->GetEyePosition(), end, box.mins, box.maxs, (box.radius * 0.40f)) && !loh && !(can_baim_next_tick && ctx.m_settings.aimbot_prefer_body) /*&& !log.best_record->shot_this_tick*/ && !bodyaim)
+				prefered_hitbox = HITBOX_NECK;
+
+			if (ctx.m_settings.aimbot_prefer_body && ctx.shots_fired[idx - 1] > 2)
+				prefered_hitbox = HITBOX_BODY;
+
+			auto phitbox = feature::ragebot.get_hitbox(entity, prefered_hitbox, entity->m_CachedBoneData().Base());
+			float pdmg = 0.f;
+
+			bool prior_was_viable = false;
+
+			switch (prefered_hitbox)
+			{
+			case HITBOX_HEAD:
+				pdmg = head_damage;
+				prior_was_viable = head_was_viable;
+				break;
+			case HITBOX_NECK:
+				pdmg = neck_damage;
+				prior_was_viable = neck_was_viable;
+				break;
+			case HITBOX_BODY:
+				pdmg = stomach_damage;
+				prior_was_viable = stomach_was_viable;
+				break;
+			case HITBOX_PELVIS:
+				pdmg = pelvis_damage;
+				prior_was_viable = pelvis_was_viable;
+				break;
+			case HITBOX_CHEST:
+				pdmg = chest_damage;
+				prior_was_viable = chest_was_viable;
+				break;
+			default:
+				pdmg = feature::ragebot.can_hit(prefered_hitbox, entity, phitbox, entity->m_CachedBoneData().Base(), &prior_was_viable);
+				break;
+			}
+
+			const auto viable_dmg = (hp > ctx.m_settings.aimbot_min_damage_viable || !ctx.m_settings.aimbot_wall_scale_damage_on_hp) ? ctx.m_settings.aimbot_min_damage_viable : hp;
+			const auto wall_dmg = (hp > ctx.m_settings.aimbot_min_damage || !ctx.m_settings.aimbot_scale_damage_on_hp) ? ctx.m_settings.aimbot_min_damage : hp;
+			auto good_prior_dmg = (prior_was_viable ? (pdmg > max_damage && pdmg > viable_dmg) : (pdmg > max_damage && pdmg > wall_dmg && ctx.m_settings.aimbot_autowall));
+
+			if (ctx.get_key_press(ctx.m_settings.aimbot_min_damage_override))
+				good_prior_dmg = pdmg > max(hp, ctx.m_settings.aimbot_min_damage_override_val);
+
+			if (!phitbox.IsZero() && good_prior_dmg)
+			{
+				max_damage = pdmg;
+				best_player = entity;
+				best_hitbox = phitbox;
+				best_hitboxid = prefered_hitbox;
+			}
+			else
+			{
+				int max_hc = -1.f;
+
+				for (auto i = loopsize; i >= 0; i--)
+				{
+					if (i > loopsize || i < 0)
+						continue;
+
+					if (is_zeus && (hitboxesLoop[i] <= 1 || hitboxesLoop[i] == 11 || hitboxesLoop[i] == 12))
+						continue;
+
+					//if (!resolver_log->has_been_resolved && agressive_baim && (baim_dmg > hp || baim_dmg > (hp * 0.5f)) && (hitboxesLoop[i] <= 1/* || hitboxesLoop[i] == HITBOX_UPPER_CHEST*/))
+					//	continue;
+
+					if ((/*ctx.m_settings.aimbot_ignore_head || *//*prefered_hitbox > HITBOX_NECK && ctx.m_settings.aimbot_prefer_body ||*/ ctx.get_key_press(ctx.m_settings.aimbot_bodyaim_key) || can_baim_next_tick && ctx.m_settings.aimbot_prefer_body/* || resolver_log->resolving_method != log.best_record->rtype*/) && hitboxesLoop[i] <= 1)
+						continue;
+
+					if (loh && hitboxesLoop[i] != 0)
+						continue;
+
+					//{ "head", "chest", "body", "arms", "legs", "foot" }
+
+					if ((!ctx.m_settings.aimbot_hitboxes[0] && hitboxesLoop[i] <= HITBOX_NECK)
+						|| (!ctx.m_settings.aimbot_hitboxes[1] && (HITBOX_CHEST == hitboxesLoop[i] || HITBOX_UPPER_CHEST == hitboxesLoop[i]))
+						|| (!ctx.m_settings.aimbot_hitboxes[2] && (hitboxesLoop[i] >= HITBOX_PELVIS && hitboxesLoop[i] <= HITBOX_THORAX))
+						|| (!ctx.m_settings.aimbot_hitboxes[3] && hitboxesLoop[i] >= HITBOX_RIGHT_HAND)
+						|| (!ctx.m_settings.aimbot_hitboxes[4] && (hitboxesLoop[i] >= HITBOX_RIGHT_THIGH && hitboxesLoop[i] <= HITBOX_LEFT_CALF))
+						|| ((!ctx.m_settings.aimbot_hitboxes[5] || !log.best_record->can_aim_at_foot) && (hitboxesLoop[i] == HITBOX_RIGHT_FOOT || hitboxesLoop[i] == HITBOX_LEFT_FOOT)))
+						continue;
+
+					auto hitbox = feature::ragebot.get_hitbox(entity, hitboxesLoop[i], entity->m_CachedBoneData().Base());
+
+					if (hitbox.IsZero())
+						continue;
+
+					auto angle = Math::CalcAngle(ctx.m_local()->GetEyePosition(), hitbox);
+					angle.Clamp();
+
+					auto dmg = 0.f;
+					bool was_viable = false;
+
+					switch (hitboxesLoop[i])
+					{
+					case HITBOX_HEAD:
+						dmg = head_damage;
+						was_viable = head_was_viable;
+						break;
+					case HITBOX_NECK:
+						dmg = neck_damage;
+						was_viable = neck_was_viable;
+						break;
+					case HITBOX_BODY:
+						dmg = stomach_damage;
+						was_viable = stomach_was_viable;
+						break;
+					case HITBOX_PELVIS:
+						dmg = pelvis_damage;
+						was_viable = pelvis_was_viable;
+						break;
+					case HITBOX_CHEST:
+						dmg = chest_damage;
+						was_viable = chest_was_viable;
+						break;
+					default:
+						dmg = feature::ragebot.can_hit(hitboxesLoop[i], entity, hitbox, entity->m_CachedBoneData().Base(), &was_viable);
+						break;
+					}
+
+					auto good_dmg = (prior_was_viable ? dmg >= max_damage && dmg >= viable_dmg : dmg >= max_damage && dmg >= wall_dmg && ctx.m_settings.aimbot_autowall);
+
+					if (ctx.get_key_press(ctx.m_settings.aimbot_min_damage_override))
+						good_dmg = dmg > max(hp, ctx.m_settings.aimbot_min_damage_override_val);
+
+					int hc = 0;
+
+					if (good_dmg && feature::ragebot.mini_hit_chance(angle, entity, hitboxesLoop[i], hc) && (hc >= int(max_hc * 0.8f)))
+					{
+						max_damage = dmg;
+						best_player = entity;
+						best_hitbox = hitbox;
+						best_hitboxid = hitboxesLoop[i];
+						max_hc = hc;
+					}
+				}
+			}
+
+			if (best_player == nullptr || best_hitboxid == -1) {
+				skip_player[idx - 1] = 1;
+				players_skipped++;
+			}
+			//feature::lagcomp.finish_position_adjustment(entity);
+
+			log.restore_record.apply(entity, true);
+
+			if (best_player) {
+				//skip_player[idx - 1] = 0;
+				break;
+			}
+		}
+
+		float max_dmg = 0.1f;
+
+		int walls_penetrated = 0;
+
+		if (best_player != nullptr && best_hitboxid != -1)
+		{
+			auto& log = feature::lagcomp.records[best_player->entindex() - 1];
+
+			log.best_record->apply(best_player);
+
+			bool center = false;
+
+			if (best_player->get_multipoints(best_hitboxid, ctx.points[best_player->entindex() - 1][best_hitboxid], best_player->m_CachedBoneData().Base(), center))
+			{
+				best_hitbox.clear();
+
+				auto resolve_info = &feature::resolver.player_records[best_player->entindex() - 1];
+
+				auto points = ctx.points[best_player->entindex() - 1][best_hitboxid];
+				bool center_was_viable = false;
+				auto cwall = feature::autowall.CanHit(ctx.m_local()->GetEyePosition(), points.back(), ctx.m_local(), best_player, best_hitboxid, &center_was_viable);
+
+				auto angle = Math::CalcAngle(ctx.m_local()->GetEyePosition(), points.back());
+				angle.Clamp();
+
+				int cchance = 0;
+
+				if ((cwall >= best_player->m_iHealth() || (cwall * 2.f) >= best_player->m_iHealth()) && ((4 - ctx.last_penetrated_count) <= 1 || center_was_viable) && best_hitboxid >= 1 && feature::ragebot.mini_hit_chance(angle, best_player, best_hitboxid, cchance) && ctx.m_settings.aimbot_hitchance_val <= cchance) { //fabs(Math::AngleDiff(resolve_info->original_abs_yaw, best_player->get_animation_state()->abs_yaw)) < 25.f && best_hitboxid > 1)
+					best_hitbox = points.back();
+					max_dmg = cwall;
+					walls_penetrated = (4 - ctx.last_penetrated_count);
+				}
+				else
+				{
+					int max_hc = -1.f;
+					float dist = 9999.f;
+					bool had_points = false;
+
+					for (auto i = 0; i < points.size(); i++)
+					{
+						Vector point = points[i];
+
+						const auto dmg = feature::autowall.CanHit(ctx.m_local()->GetEyePosition(), point, ctx.m_local(), best_player, best_hitboxid);
+
+						auto chance = 0;
+
+						auto angle = Math::CalcAngle(ctx.m_local()->GetEyePosition(), point);
+						angle.Clamp();
+
+						//const auto hdist = point.DistanceSquared(log.head_position);
+
+						//if ((hdist > (dist * 2)) && best_hitboxid == 1 && had_points)
+						//	continue;
+
+						if (dmg > max_dmg && feature::ragebot.mini_hit_chance(angle, best_player, best_hitboxid, chance) && int(max_hc * 0.8f) <= chance)
+						{
+							max_dmg = dmg;
+							best_hitbox = point;
+							max_hc = chance;
+							walls_penetrated = (4 - ctx.last_penetrated_count);
+						}
+					}
+				}
+			}
+		}
+
+		data->hitchance = false;
+		data->aim_angles = QAngle(0, 0, 0);
+		int hc = 0;
+
+		if (best_player != nullptr && !best_hitbox.IsZero()) {
+			data->aim_angles = Math::CalcAngle(ctx.m_local()->GetEyePosition(), best_hitbox);
+			data->aim_angles.Clamp();
+
+			data->hitchance = feature::ragebot.hit_chance(data->aim_angles, best_player, (!m_weapon()->can_exploit(ctx.m_settings.aimbot_tickbase_exploit == 3 ? 14 : 12) && ctx.m_local()->m_iShotsFired() > 0 && ctx.m_settings.aimbot_tickbase_exploit >= 2 && ctx.exploit_allowed) ? ctx.m_settings.aimbot_doubletap_hitchance_val : ctx.m_settings.aimbot_hitchance_val, best_hitboxid, max_dmg * 0.5f, hc);
+		}
+
+		data->best_player = best_player;
+		data->best_hitbox = best_hitbox;
+		data->best_hitboxid = best_hitboxid;
+
+		data->walls_penetrated = walls_penetrated;
+		data->max_dmg = max_dmg;
+		data->job_done = true;
+	};
+
+	m_entities.clear();
+	static float last_shoot_time = 0.f;
+	C_BasePlayer* best_player = nullptr;
+	Vector best_hitbox = Vector::Zero;
+	int	best_hitboxid = -1;
+
+	if (!ctx.m_local() || ctx.m_local()->IsDead() || cmd->weaponselect > 0) return false;
+
+	auto local_weapon = m_weapon();
+
+	if (!local_weapon /*|| !ctx.pressed_keys[6]*/) return false;
+
+	/*auto IsGrenade = [](int item)
+	{
+		if (item == weapon_flashbang
+			|| item == weapon_hegrenade
+			|| item == weapon_smokegrenade
+			|| item == weapon_molotov
+			|| item == weapon_decoy
+			|| item == weapon_incgrenade
+			|| item == weapon_tagrenade)
+			return true;
+		else
+			return false;
+	};*/
+
+	/*if ((Source::m_pGlobalVars->realtime - last_shoot_time) > 0.25f) {
+		cheat::features::antiaimbot.flip_side = false;
+
+		if (cheat::Cvars.anti_aim_desync_extend_limit_on_shot.GetValue())
+			cheat::features::antiaimbot.extend = false;
+	}*/
+
+	static auto max_fps = 0.f;
+	static int low_fps_ticks = 0;
+	static bool fps_dropped = false;
+	static float low_fps = 0.f;
+	const auto prefered_fps = float(1 / csgo.m_globals()->interval_per_tick);
+
+	if (max_fps < ctx.fps)
+		max_fps = ctx.fps;
+
+	if (ctx.fps <= (max_fps / 4) || Engine::Prediction::Instance()->m_flFrameTime >= csgo.m_globals()->interval_per_tick)
+		low_fps_ticks++;
+	else
+		low_fps_ticks = 0;
+
+	//if (low_fps_ticks > 2) {
+	//	fps_dropped = true;
+	//	low_fps = ctx.fps;
+	//}
+
+	//if (fps_dropped)
+	//{
+	//	const auto cur_fps_amt = ctx.fps / prefered_fps;
+	//	const auto low_fps_amt = low_fps / prefered_fps;
+	//
+	//	fps_dropped = (cur_fps_amt - low_fps_amt) >= 0.5f || Engine::Prediction::Instance()->m_flFrameTime >= csgo.m_globals()->interval_per_tick;
+	//}
+
+	//ctx.boost_fps = fps_dropped;
+
+	auto is_zeus = (local_weapon->m_iItemDefinitionIndex() == WEAPON_TASER);
+
+	if (!ctx.m_settings.aimbot_enabled || !local_weapon->IsGun() || local_weapon->m_iClip1() <= 0 || is_zeus && !ctx.m_settings.aimbot_allow_taser)
+		return false;
+
+	auto neyepos = ctx.m_local()->GetEyePosition();
+
+	//if (local_weapon->m_iItemDefinitionIndex() == 64 && ctx.m_settings.aimbot_auto_revolver)
+	//{
+	//	auto curtime = TICKS_TO_TIME(ctx.m_local()->m_nTickBase());
+
+	//	if (local_weapon->m_flPostponeFireReadyTime() > curtime)
+	//	{
+	//		cmd->buttons |= IN_ATTACK;
+	//	}
+	//	// COCK EXTENDER
+	//	else if (local_weapon->m_flNextSecondaryAttack() > curtime)
+	//	{
+	//		cmd->buttons |= IN_ATTACK2;
+	//	}
+	//}
+
+	if (ctx.m_settings.aimbot_auto_revolver)
+	{
+		/*if (local_weapon->m_iItemDefinitionIndex() == 64)
+		{
+			auto v7 = Source::m_pGlobalVars->curtime;
+			if (r8cock_time <= (Source::m_pGlobalVars->frametime + v7))
+				r8cock_time = v7 + 0.249f;
+			else
+				cmd->buttons |= IN_ATTACK;
+		}
+		else
+		{
+			r8cock_time = 0.0;
+		}
+
+		local_weapon->m_flPostponeFireReadyTime() = r8cock_time;*/
+
+		if (local_weapon->m_iItemDefinitionIndex() == 64)
+		{
+			auto v33 = TICKS_TO_TIME(ctx.m_local()->m_nTickBase());
+			is_cocking = 1;
+
+			if (!ctx.pressed_keys[1] && !ctx.pressed_keys[2]) {
+				cmd->buttons &= ~IN_ATTACK;
+				cmd->buttons &= ~IN_ATTACK2;
+			}
+
+			if (local_weapon->can_cock())
+			{
+				if (r8cock_time <= v33)
+				{
+					if (local_weapon->m_flNextSecondaryAttack() <= v33)
+						r8cock_time = v33 + 0.234375f;
+					else
+						cmd->buttons |= IN_ATTACK2;
+				}
+				else
+					cmd->buttons |= IN_ATTACK;
+
+				is_cocking = v33 > r8cock_time;
+			}
+			else
+			{
+				is_cocking = false;
+				r8cock_time = v33 + 0.234375f;
+				cmd->buttons &= ~IN_ATTACK;
+			}
+		}
+	}
+
+	//////////////////////////////////////////////////
+
+	lagcomp_mt lcdata;
+	Threading::QueueJobRef(fill_players_list, &lcdata);
+	Threading::FinishQueue();
+
+	if (m_entities.empty() || !lcdata.job_done) {
+		//feature::lagcomp.finish_position_adjustment();
+		return false;
+	}
+
+	aimbot_mt adata;
+	adata.aim_angles = QAngle(0, 0, 0);
+	adata.hitchance = false;
+	adata.max_dmg = 0.f;
+	adata.walls_penetrated = 0;
+	Threading::QueueJobRef(hitscan_entities, &adata);
+	Threading::FinishQueue();
+
+	best_player = adata.best_player;
+	best_hitbox = adata.best_hitbox;
+	best_hitboxid = adata.best_hitboxid;
+
+	/*local_weapon->UpdateAccuracyPenalty();*/
+
+	if (!best_player || best_hitbox.IsZero() || adata.aim_angles.IsZero() || best_hitboxid == -1)
+		return false;
+
+	const auto factor = csgo.m_globals()->interval_per_tick;
+	auto pred = (ctx.m_local()->GetEyePosition() + (ctx.m_local()->m_vecAbsVelocity() * factor));
+	const auto dmg = feature::autowall.CanHit(pred, best_hitbox, ctx.m_local(), best_player, best_hitboxid);
+
+	const auto cur_mul = float(best_player->m_iHealth() / adata.max_dmg);
+	const auto new_mul = float(best_player->m_iHealth() / (dmg * 0.9f));
+
+	auto entity_index = best_player->entindex() - 1;
+
+	auto& log = feature::lagcomp.records[entity_index];
+	auto& r_log = feature::resolver.player_records[entity_index];
+	log.restore_record.apply(best_player, true);
+
+	auto is_zoomable_weapon = (local_weapon->m_iItemDefinitionIndex() == WEAPON_SSG08 || local_weapon->m_iItemDefinitionIndex() == WEAPON_AWP || local_weapon->m_iItemDefinitionIndex() == WEAPON_SCAR20 || local_weapon->m_iItemDefinitionIndex() == WEAPON_G3SG1);
+	auto sniper = (local_weapon->m_iItemDefinitionIndex() == WEAPON_SSG08 || local_weapon->m_iItemDefinitionIndex() == WEAPON_AWP);
+
+	ctx.do_autostop = (!ctx.m_settings.aimbot_autostop_options[1] && ctx.m_settings.aimbot_autostop) || (ctx.m_settings.aimbot_autostop && (local_weapon->can_shoot() /*|| !local_weapon->can_exploit(10)*/ || local_weapon->m_iItemDefinitionIndex() == 64 && local_weapon->can_cock()));// local_weapon->can_shoot() || (fmaxf(ctx.m_local()->m_flNextAttack(), local_weapon->m_flNextPrimaryAttack()) - csgo.m_globals()->curtime) < 0.1f && (fmaxf(ctx.m_local()->m_flNextAttack(), local_weapon->m_flNextPrimaryAttack()) - csgo.m_globals()->curtime) >= 0.0f; //csgo.m_globals()->curtime >= m_flNextPrimaryAttack()
+
+	if (local_weapon->IsGun() && local_weapon->can_shoot() && cur_mul <= new_mul && (send_packet || feature::anti_aim.unchocking || ctx.fakeducking || sniper))
+	{
+		if (ctx.m_settings.aimbot_autoscope != 0 && (ctx.m_settings.aimbot_autoscope == 1 || ctx.m_settings.aimbot_autoscope == 2 && !adata.hitchance) && !ctx.m_local()->m_bIsScoped() && is_zoomable_weapon && !(cmd->buttons & IN_JUMP))
+		{
+			cmd->buttons |= 0x800;
+			return false;
+		}
+
+		auto is_tick_valid = log.tick_count != -1;
+
+		if (adata.hitchance && is_tick_valid && (ctx.can_aimbot || ctx.m_settings.aimbot_tickbase_exploit == 0 || !ctx.exploit_allowed) && (ctx.m_settings.fake_lag_shooting && csgo.m_client_state()->m_iChockedCommands < ctx.m_settings.fake_lag_value || !ctx.m_settings.fake_lag_shooting))
+		{
+			cmd->tick_count = log.tick_count;
+
+			cmd->viewangles = adata.aim_angles;
+			cmd->buttons |= IN_ATTACK;
+
+			if (!is_zeus)
+				ctx.shots_fired[entity_index] += 1;
+
+			if (!ctx.fakeducking && !send_packet && !ctx.m_settings.fake_lag_shooting && (!ctx.m_settings.aimbot_tickbase_exploit || !ctx.exploit_allowed)) {
+				send_packet = true;
+
+				if (feature::anti_aim.animation_speed <= 6.f && ctx.m_local()->get_animation_state()->t_since_stopped_moving >= 0.1f)
+					ctx.send_next_tick = PACKET_CHOKE;
+			}
+
+			if (ctx.m_settings.fake_lag_shooting)
+				send_packet = false;
+
+			if (auto net = csgo.m_engine()->GetNetChannelInfo(); net != nullptr) {
+				//auto impact_time = csgo.m_globals()->tickcount + (send_packet ? 1 : (14 - csgo.m_client_state()->m_iChockedCommands)) + TIME_TO_TICKS(net->GetLatency(FLOW_OUTGOING) + csgo.m_globals()->interval_per_tick);
+				ctx.fired_shot.emplace_back(_shotinfo(best_player, (r_log.resolving_method != 0 ? (r_log.resolving_method == 1 ? log.best_record->leftmatrixes : log.best_record->rightmatrixes) : log.best_record->matrixes), ctx.m_local()->GetEyePosition(), best_hitbox, &feature::lagcomp.records[entity_index], local_weapon->GetInaccuracy(), ctx.m_local()->m_flVelocityModifier(), best_hitboxid, (int)adata.max_dmg, feature::misc.hitbox_to_hitgroup(best_hitboxid), adata.walls_penetrated, csgo.m_globals()->realtime));
+
+				if (ctx.m_settings.misc_notifications[3])
+					_events.push_back(_event(std::string(sxor("fired shot at ") + best_player->m_szNickName() + "'s " + hitbox_to_string(best_hitboxid) + " [" + std::to_string(best_hitboxid) + "] | bt: " + std::to_string(log.backtrack_ticks) + "t | dmg: " + std::to_string((int)adata.max_dmg) + " | R:" + std::to_string(feature::resolver.player_records[entity_index].resolving_method) + std::to_string(feature::resolver.player_records[entity_index].resolver_type) + " [" + std::to_string(log.best_record->lag) + "]:[" + std::to_string(ctx.m_local()->m_flVelocityModifier()) + "] | shots: " + std::to_string(ctx.shots_fired[entity_index] - 1))));
+			}
+
+			if (!ctx.m_settings.aimbot_silent_aim)
+				csgo.m_engine()->SetViewAngles(adata.aim_angles);
+
+			//Engine::Prediction::Instance()->Begin(cmd, true);
+
+			if (ctx.m_settings.misc_visuals_hitboxes[0])
+				visualize_hitboxes(best_player, log.best_record->matrixes, ctx.m_settings.misc_visuals_hitboxes_color, ctx.m_settings.misc_visuals_hitboxes_time);
+
+			ctx.left_side = !ctx.left_side;
+
+			last_shoot_time = csgo.m_globals()->curtime;
+
+			ctx.shot_angles = adata.aim_angles;
+			ctx.did_shot = true;
+
+			return true;
+		}
+	}
+
+	return false;
+}
